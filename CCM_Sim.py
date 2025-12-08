@@ -105,6 +105,44 @@ class RCCMSimulator:
         self.J = np.diag([0.02, 0.02, 0.04])
         self.J_inv = np.linalg.inv(self.J)
         
+    def get_controller_gain_quat(self, quat):
+        """
+        Reconstructs K(q) numerically given the current quaternion.
+        Args:
+            quat: np.array [qw, qx, qy, qz] (normalized)
+        """
+        # 1. Evaluate Basis Monomials
+        # self.exps contains tuples like (2, 0, 1, 1) for qw^2 * qy * qz
+        weights = []
+        for exp in self.exps:
+            val = 1.0
+            # Iterate through the 4 quaternion components
+            for i, p in enumerate(exp):
+                if p > 0:
+                    val *= (quat[i] ** p)
+            weights.append(val)
+            
+        # 2. Reconstruct W and Y matrices via tensor sum
+        # W_num = sum( coeff_k * weight_k )
+        # We use a loop or list comprehension (fast enough for ~70 basis terms)
+        W_num = sum(self.Ws[k] * w for k, w in enumerate(weights))
+        Y_num = sum(self.Ys[k] * w for k, w in enumerate(weights))
+        
+        # 3. Regularization (Crucial for high-degree polynomials)
+        # Prevents numerical singularity if the polynomial dips slightly
+        W_reg = W_num + 1e-6 * np.eye(12)
+        
+        # 4. Compute K = Y * inv(W)
+        # Using solve(A, B) for A*X = B => X = A\B
+        # We want K = Y @ inv(W) => K.T = inv(W).T @ Y.T = inv(W) @ Y.T
+        try:
+            K_num = np.linalg.solve(W_reg, Y_num.T).T
+        except np.linalg.LinAlgError:
+            print("WARNING: W(q) is singular. Returning zero gain.")
+            return np.zeros((6, 12))
+            
+        return K_num
+        
     def get_controller_gain(self, R_curr):
         r_flat = R_curr.flatten()
         weights = []
@@ -129,37 +167,83 @@ class RCCMSimulator:
         try:
             K_num = np.linalg.solve(W_reg, Y_num.T).T
         except np.linalg.LinAlgError:
+            print("WARNING: W(R) is singular. Returning zero gain.")
             return np.zeros((6, 12)) # Safety fallback
             
         return K_num
 
     def nominal_trajectory(self, t):
-        # (Same as before)
+        # -------------------------------------------------
+        # 1. TRANSLATIONAL (Figure-8)
+        # -------------------------------------------------
         omega_traj = 1.0
+        
+        # Position
         px = np.sin(omega_traj * t)
         py = np.sin(omega_traj * t / 2)
         pz = 1.0 
         
+        # Velocity
         vx = omega_traj * np.cos(omega_traj * t)
         vy = (omega_traj/2) * np.cos(omega_traj * t / 2)
         vz = 0
         
+        # Acceleration
         ax = -(omega_traj**2) * np.sin(omega_traj * t)
         ay = -(omega_traj/2)**2 * np.sin(omega_traj * t / 2)
         az = 0
         
-        R_ref = np.eye(3)
-        w_ref = np.zeros(3)
-        dw_ref = np.zeros(3)
-        
+        # Feedforward Force
         g_vec = np.array([0, 0, -self.g])
-        acc_vec = np.array([ax, ay, az])
-        f_nom = self.m * (acc_vec - g_vec)
-        tau_nom = np.zeros(3)
-        
-        u_nom = np.hstack([f_nom, tau_nom])
-        return np.hstack([px, py, pz]), R_ref, np.hstack([vx, vy, vz]), w_ref, u_nom
+        f_nom = self.m * (np.array([ax, ay, az]) - g_vec)
 
+        # -------------------------------------------------
+        # 2. ROTATIONAL (Yaw Spin + Pitch Nod)
+        # -------------------------------------------------
+        psi = 0.5 * t              # Yaw
+        theta = 0.35 * np.sin(2*t) # Pitch
+        phi = 0.0                  # Roll
+        
+        # Derivatives
+        dpsi = 0.5
+        dtheta = 0.35 * 2 * np.cos(2*t)
+        dphi = 0.0
+        
+        ddpsi = 0.0
+        ddtheta = -0.35 * 4 * np.sin(2*t)
+        ddphi = 0.0
+        
+        # A. Reference Rotation Matrix (The Fix!)
+        # Create Rotation object from Euler angles
+        R_obj = Rotation.from_euler('zyx', [psi, theta, phi])
+        R_ref = R_obj.as_matrix() # Returns 3x3 Matrix (Size 9 when flattened)
+        
+        # B. Reference Angular Velocity (Body Frame)
+        st, ct = np.sin(theta), np.cos(theta)
+        sp, cp = np.sin(phi), np.cos(phi)
+        
+        wx = dphi - dpsi * st
+        wy = dtheta * cp + dpsi * ct * sp
+        wz = dpsi * ct * cp - dtheta * sp
+        w_ref = np.array([wx, wy, wz])
+        
+        # C. Reference Angular Acceleration
+        dwx = ddphi - (ddpsi * st + dpsi * ct * dtheta)
+        dwy = (ddtheta*cp - dtheta*sp*dphi) + \
+              (ddpsi*ct*sp - dpsi*st*dtheta*sp + dpsi*ct*cp*dphi)
+        dwz = (ddpsi*ct*cp - dpsi*st*dtheta*cp - dpsi*ct*sp*dphi) - \
+              (ddtheta*sp + dtheta*cp*dphi)
+              
+        dw_ref = np.array([dwx, dwy, dwz])
+        
+        # Feedforward Torque
+        tau_nom = self.J @ dw_ref + np.cross(w_ref, self.J @ w_ref)
+        
+        # Combine Inputs
+        u_nom = np.hstack([f_nom, tau_nom])
+        
+        return np.hstack([px, py, pz]), R_ref, np.hstack([vx, vy, vz]), w_ref, u_nom
+    
     def dynamics(self, t, x_state, u_control, w_dist):
         # (Same as before)
         R_flat = x_state[3:12]
@@ -198,7 +282,7 @@ class RCCMSimulator:
         k4 = self.dynamics(t + dt, state + dt * k3, u, dist)
         return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
-    def run_simulation(self, duration=10.0, dt=0.001):
+    def run_simulation(self, duration=10.0, dt=0.001, rot_representation='R'):
         steps = int(duration / dt)
         times = np.linspace(0, duration, steps)
         
@@ -232,15 +316,19 @@ class RCCMSimulator:
             error_vec = np.concatenate([e_p, eta, e_v, e_w])
             
             # Control
-            K = self.get_controller_gain(R_curr)
+            if rot_representation == 'R':
+                K = self.get_controller_gain(R_curr)
+            elif rot_representation == 'quat':
+                quat = Rotation.from_matrix(R_curr).as_quat()  # [x, y, z, w]
+                K = self.get_controller_gain(quat[[3,0,1,2]])  # Convert to [w, x, y, z]
             u_fb = K @ error_vec 
             u_total = u_nom + u_fb
             
             # Disturbance
-            dist = np.zeros(6)
+            dist = np.random.uniform(0.0, 1.0, size=6)
             if 2.0 < t < 4.0:
-                dist[0] = 1.5 
-                dist[3] = 0.1 
+                dist[0] += 1.5 
+                dist[3] += 0.1 
             
             # --- FIX 2: RK4 INTEGRATION ---
             state = self.rk4_step(t, state, u_total, dist, dt)
@@ -278,6 +366,6 @@ if __name__ == "__main__":
     sim = RCCMSimulator(W_vals, Y_vals, basis_exps)
 
     # 4. Run
-    pos, ref, t, err = sim.run_simulation()
+    pos, ref, t, err = sim.run_simulation(rot_representation='R')
     alpha_val = data["alpha"] # from pickle load
     plot_rccm_results(pos, ref, t, err, tube_alpha=alpha_val, dist_max=1.5)
