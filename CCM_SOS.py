@@ -10,19 +10,17 @@ np.set_printoptions(precision=4, suppress=True)
 
 def print_matrices_and_gains(Ws, Ys, basis_exps):
     """
-    Reconstructs symbolic W(R), Y(R) and evaluates K(R) at specific points.
-    Now handles ANY polynomial degree.
+    Reconstructs symbolic W(R), Y(R) and evaluates K(R).
+    Robust to inputs being either CVXPY Variables OR NumPy Arrays.
     """
     print("\n" + "="*60)
     print(f">>> ANALYZING CONTROLLER STRUCTURE (Basis Size: {len(Ws)})")
     print("="*60)
 
-    # 1. Setup Symbols for R
-    # Variables: r11, r12, r13, r21 ... r33
+    # 1. Setup Symbols
     r_syms = sp.symbols('r11 r12 r13 r21 r22 r23 r31 r32 r33')
 
-    # 2. Construct Symbolic Basis Vector Dynamically
-    # basis_exps is list of tuples, e.g. [(0,0..), (1,0..), (0,2..)...]
+    # 2. Construct Symbolic Basis Vector
     basis_syms = []
     for exp in basis_exps:
         term = 1
@@ -31,80 +29,93 @@ def print_matrices_and_gains(Ws, Ys, basis_exps):
                 term *= (r_syms[i] ** power)
         basis_syms.append(term)
 
-    # 3. Extract Numerical Values from CVXPY
-    # (Clean up numerical noise < 1e-5)
-    W_vals = [np.where(abs(mat.value) < 1e-5, 0, mat.value) for mat in Ws]
-    Y_vals = [np.where(abs(mat.value) < 1e-5, 0, mat.value) for mat in Ys]
+    # 3. Safe Extraction Helper
+    def get_val(item):
+        # If it's a CVXPY Variable/Expression, get .value
+        if hasattr(item, 'value'):
+            v = item.value
+            if v is None: return np.zeros(item.shape) # Safety for unsolved vars
+            return v
+        # Otherwise assume it's already a numpy array
+        return item
+
+    # Clean up numerical noise < 1e-5
+    W_vals = [np.where(abs(get_val(mat)) < 1e-5, 0, get_val(mat)) for mat in Ws]
+    Y_vals = [np.where(abs(get_val(mat)) < 1e-5, 0, get_val(mat)) for mat in Ys]
 
     # 4. Construct Symbolic Matrices
     def build_symbolic(matrices, rows, cols):
         M_sym = sp.zeros(rows, cols)
         for k, mat in enumerate(matrices):
-            # Add mat * basis_sym_k
-            M_sym += sp.Matrix(mat) * basis_syms[k]
+            # Check if matrix is non-zero before adding (optimization for large basis)
+            if np.any(mat): 
+                M_sym += sp.Matrix(mat) * basis_syms[k]
         return M_sym
 
-    W_sym = build_symbolic(W_vals, 12, 12)
-    Y_sym = build_symbolic(Y_vals, 6, 12)
+    # Note: For Degree 4 (715 terms), symbolic construction might be slow.
+    # We only print the top-left block to keep it responsive.
+    print("Constructing Symbolic Representations (this might take a moment)...")
+    
+    # Only build the Position block (0:3, 0:3) to save time
+    W_pos_sym = sp.zeros(3, 3)
+    for k, mat in enumerate(W_vals):
+        if np.any(mat[0:3, 0:3]):
+            W_pos_sym += sp.Matrix(mat[0:3, 0:3]) * basis_syms[k]
+
+    # Only build the First Row of Y to save time
+    Y_row_sym = sp.zeros(1, 12)
+    for k, mat in enumerate(Y_vals):
+        if np.any(mat[0, :]):
+            Y_row_sym += sp.Matrix(mat[0:1, :]) * basis_syms[k]
 
     # 5. Print Symbolic Structure
     print("\n[1] SYMBOLIC METRIC W(R) (Top-Left 3x3 Block - Position):")
     print("-----------------------------------------------------------")
-    sp.pprint(W_sym[0:3, 0:3])
+    sp.pprint(W_pos_sym)
 
     print("\n[2] SYMBOLIC DUAL CONTROLLER Y(R) (First Row - Force X):")
     print("--------------------------------------------------------")
-    sp.pprint(Y_sym[0, :])
+    sp.pprint(Y_row_sym)
     
-    # 6. Numerical Gain Analysis (Gain Scheduling)
+    # 6. Numerical Gain Analysis
     print("\n[3] GAIN SCHEDULING ANALYSIS (K = Y * inv(W))")
     print("--------------------------------------------------------")
     
     def get_K_at_R(R_in):
-        # 1. Calculate Basis Weights for this specific R
-        # Flatten R: [r11, r12, ..., r33]
         r_vals = R_in.flatten()
-        
         weights = []
         for exp in basis_exps:
-            # Evaluate monomial: r11^p1 * r12^p2 ...
             val = 1.0
             for i, power in enumerate(exp):
-                if power > 0:
-                    val *= (r_vals[i] ** power)
+                if power > 0: val *= (r_vals[i] ** power)
             weights.append(val)
         
-        # 2. Sum matrices
+        # Tensor contraction: Sum( weight_k * Matrix_k )
+        # Optimization: Use tensordot if possible, or loop
         W_curr = sum(W_vals[k] * weights[k] for k in range(len(weights)))
         Y_curr = sum(Y_vals[k] * weights[k] for k in range(len(weights)))
         
-        # 3. Compute Gain
         return Y_curr @ np.linalg.inv(W_curr)
     
-    print("\nGain Values at Different Orientations:")
-    # Case A: Hover (Identity)
-    R_hover = np.eye(3)
-    K_hover = get_K_at_R(R_hover)
-    print("At Hover (Identity Rotation):", K_hover)
+    # Case A: Hover
+    K_hover = get_K_at_R(np.eye(3))
 
-    # Case B: 90 Degree Yaw
-    R_yaw90 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
-    K_yaw90 = get_K_at_R(R_yaw90)
-    print("At 90 Degree Yaw Rotation:", K_yaw90)
+    # Case B: 90 Deg Yaw
+    R_yaw = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+    K_yaw = get_K_at_R(R_yaw)
 
-    # Case C: 45 Degree Roll
-    theta = np.deg2rad(45)
-    R_roll45 = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
-    K_roll45 = get_K_at_R(R_roll45)
-    print("At 45 Degree Roll Rotation:", K_roll45)
+    # Case C: 45 Deg Roll
+    th = np.deg2rad(45)
+    R_roll = np.array([[1, 0, 0], [0, np.cos(th), -np.sin(th)], [0, np.sin(th), np.cos(th)]])
+    K_roll = get_K_at_R(R_roll)
 
     print(f"{'Condition':<15} | {'K_px (F_x / e_px)':<20} | {'K_py (F_x / e_py)':<20}")
     print("-" * 60)
     print(f"{'Hover':<15} | {K_hover[0,0]:<20.4f} | {K_hover[0,1]:<20.4f}")
-    print(f"{'Yaw 90':<15} | {K_yaw90[0,0]:<20.4f} | {K_yaw90[0,1]:<20.4f}")
-    print(f"{'Roll 45':<15} | {K_roll45[0,0]:<20.4f} | {K_roll45[0,1]:<20.4f}")
+    print(f"{'Yaw 90':<15} | {K_yaw[0,0]:<20.4f} | {K_yaw[0,1]:<20.4f}")
+    print(f"{'Roll 45':<15} | {K_roll[0,0]:<20.4f} | {K_roll[0,1]:<20.4f}")
 
-    diff = np.linalg.norm(K_hover - K_yaw90)
+    diff = np.linalg.norm(K_hover - K_yaw)
     print(f"\nGain Difference Norm (Hover vs Yaw90): {diff:.4f}")
 
 # ==============================================================================
@@ -187,6 +198,211 @@ def create_sos_constraint(poly_matrix, n_vars, degree):
 # ==============================================================================
 # PART 2: SOLVER
 # ==============================================================================
+def solve_rccm_sample_based(num_samples=30, degree=4):
+    print(f">>> Setting up Tensorized RCCM (Degree {degree}, {num_samples} samples)...")
+    
+    # 1. SETUP & CONSTANTS
+    n_x, n_u, n_w, n_r = 12, 6, 6, 9
+    m, lam = 1.0, 0.5
+    
+    J_val = np.diag([0.02, 0.02, 0.04])
+    J_inv = np.linalg.inv(J_val)
+    
+    B_np = np.zeros((n_x, n_u))
+    B_np[6:9, 0:3] = (1/m) * np.eye(3)
+    B_np[9:12, 3:6] = J_inv
+    Bw_np = B_np.copy()
+    
+    w1I3 = 10.0 * np.eye(3)
+    w2I3 = 5.0 * np.eye(3)
+    w3I3 = 1.0 * np.eye(3)
+    w4I3 = 0.1 * np.eye(3)
+    C_w = block_diag(w1I3, w2I3, w3I3, w4I3)
+
+    # 2. TENSORIZED DECISION VARIABLES
+    basis_exps = get_monomial_basis(n_r, degree)
+    n_basis = len(basis_exps)
+    print(f"Basis Size: {n_basis}")
+
+    # W is symmetric 12x12 (78 unique elements)
+    n_unique_W = (n_x * (n_x + 1)) // 2
+    W_coeffs_flat = cp.Variable((n_unique_W, n_basis))
+    
+    # Y is 6x12 (72 elements)
+    n_unique_Y = n_u * n_x
+    Y_coeffs_flat = cp.Variable((n_unique_Y, n_basis))
+    
+    alpha = cp.Variable(nonneg=True)
+    mu = cp.Variable(nonneg=True)
+
+    # Helper: Scatter Matrix S_W to map 78 unique -> 144 full
+    # Assumes Row-Major flattening (C-order)
+    row_indices, col_indices = np.triu_indices(n_x)
+    S_W = np.zeros((n_x * n_x, n_unique_W))
+    for k, (r, c) in enumerate(zip(row_indices, col_indices)):
+        idx_rc = r * n_x + c # Row-Major index
+        idx_cr = c * n_x + r # Transpose index
+        S_W[idx_rc, k] = 1.0
+        S_W[idx_cr, k] = 1.0 # Symmetry logic
+        
+    # 3. SAMPLING
+    R_samples = [np.eye(3)]
+    for _ in range(num_samples):
+        if np.random.rand() > 0.5:
+            rvec = np.random.randn(3)
+            rvec = rvec / np.linalg.norm(rvec) * np.random.uniform(0, 0.5)
+            R_samples.append(Rotation.from_rotvec(rvec).as_matrix())
+        else:
+            R_samples.append(Rotation.random().as_matrix())
+            
+    w_max = 5.0
+    w_corners = [
+        np.array([0,0,0]),
+        np.array([w_max, w_max, w_max]),
+        np.array([w_max, -w_max, -w_max]),
+        np.array([-w_max, w_max, -w_max]),
+        np.array([-w_max, -w_max, w_max])
+    ]
+
+    # 4. CONSTRAINT CONSTRUCTION
+    constraints = []
+    
+    # A. Robust W0 >> 0
+    w0_unique = W_coeffs_flat[:, 0]
+    w0_full = S_W @ w0_unique
+    # FIX: order='C'
+    constraints.append(cp.reshape(w0_full, (n_x, n_x), order='C') >> 0.01 * np.eye(n_x))
+
+    print(f"Vectorizing {len(R_samples)} x {len(w_corners)} constraints...")
+
+    def get_phi_vectors(R_val, w_val):
+        r_flat = R_val.flatten()
+        w_hat = np.array([[0, -w_val[2], w_val[1]], [w_val[2], 0, -w_val[0]], [-w_val[1], w_val[0], 0]])
+        R_dot = R_val @ w_hat
+        r_dot_flat = R_dot.flatten()
+        
+        phi = np.zeros(n_basis)
+        phi_dot = np.zeros(n_basis)
+        
+        for k, exp in enumerate(basis_exps):
+            val = 1.0
+            for i, p in enumerate(exp):
+                if p > 0: val *= (r_flat[i]**p)
+            phi[k] = val
+            
+            if sum(exp) == 0: continue
+            d_val = 0.0
+            for i, p in enumerate(exp):
+                if p > 0:
+                    term = p * (r_flat[i]**(p-1)) * r_dot_flat[i]
+                    rest = 1.0
+                    for j, pj in enumerate(exp):
+                        if i != j and pj > 0: rest *= (r_flat[j]**pj)
+                    d_val += term * rest
+            phi_dot[k] = d_val
+        return phi, phi_dot
+
+    for R_val in R_samples:
+        # Check W(R) >> 0
+        phi_R, _ = get_phi_vectors(R_val, np.zeros(3))
+        w_unique_R = W_coeffs_flat @ phi_R 
+        # FIX: order='C'
+        w_full_R = cp.reshape(S_W @ w_unique_R, (n_x, n_x), order='C')
+        constraints.append(w_full_R >> 0.01 * np.eye(n_x))
+        
+        for w_val in w_corners:
+            phi, phi_dot = get_phi_vectors(R_val, w_val)
+            
+            # 1. Reconstruct Matrices (Vectorized)
+            # W
+            w_u = W_coeffs_flat @ phi
+            # FIX: order='C'
+            W_curr = cp.reshape(S_W @ w_u, (n_x, n_x), order='C')
+            
+            # W_dot
+            wd_u = W_coeffs_flat @ phi_dot
+            # FIX: order='C'
+            W_dot_curr = cp.reshape(S_W @ wd_u, (n_x, n_x), order='C')
+            
+            # Y
+            y_f = Y_coeffs_flat @ phi
+            # FIX: order='C'
+            Y_curr = cp.reshape(y_f, (n_u, n_x), order='C')
+            
+            # 2. Dynamics A(x)
+            w_hat = np.array([[0, -w_val[2], w_val[1]], [w_val[2], 0, -w_val[0]], [-w_val[1], w_val[0], 0]])
+            Jw_hat = np.array([[0,-(J_val@w_val)[2],(J_val@w_val)[1]], [(J_val@w_val)[2],0,-(J_val@w_val)[0]], [-(J_val@w_val)[1],(J_val@w_val)[0],0]])
+            term_dyn = J_inv @ (Jw_hat - w_hat @ J_val)
+            
+            A_curr = np.zeros((12, 12))
+            A_curr[0:3, 6:9] = np.eye(3); A_curr[3:6, 3:6] = -w_hat
+            A_curr[3:6, 9:12] = np.eye(3); A_curr[9:12, 9:12] = term_dyn
+            
+            # 3. LMI 1: Stability
+            He = (A_curr @ W_curr + B_np @ Y_curr) + (A_curr @ W_curr + B_np @ Y_curr).T
+            Block11 = -W_dot_curr + He + 2 * lam * W_curr
+            
+            Row1 = cp.hstack([Block11, Bw_np])
+            Row2 = cp.hstack([Bw_np.T, -mu * np.eye(n_w)])
+            constraints.append(cp.vstack([Row1, Row2]) << 0)
+            
+            # 4. LMI 2: Tube Gain
+            CW = C_w @ W_curr
+            dim_z = 12
+            Row1_14 = cp.hstack([lam * W_curr, np.zeros((n_x, n_w)), CW.T])
+            Row2_14 = cp.hstack([np.zeros((n_w, n_x)), (alpha - mu)*np.eye(n_w), np.zeros((n_w, n_x))])
+            Row3_14 = cp.hstack([CW, np.zeros((n_x, n_w)), alpha * np.eye(dim_z)])
+            constraints.append(cp.vstack([Row1_14, Row2_14, Row3_14]) >> 0)
+
+    # 5. SOLVE
+    print(f"Solving with SCS...")
+    prob = cp.Problem(cp.Minimize(alpha), constraints)
+    
+    try:
+        prob.solve(solver=cp.SCS, verbose=True, eps=1e-3)
+    except:
+        try:
+            prob.solve(solver=cp.MOSEK, verbose=True)
+        except:
+            print("Solver Failed.")
+            return None, None, None
+
+    if prob.status in ['optimal', 'optimal_inaccurate']:
+        print(f"\nSUCCESS! Alpha = {alpha.value:.4f}")
+        
+        W_flat_val = W_coeffs_flat.value 
+        Y_flat_val = Y_coeffs_flat.value 
+        
+        W_numerical = []
+        Y_numerical = []
+        
+        for k in range(n_basis):
+            w_u_k = W_flat_val[:, k]
+            w_full = S_W @ w_u_k
+            # FIX: Ensure reconstruction uses same order='C'
+            W_numerical.append(w_full.reshape(n_x, n_x)) # numpy default is C
+            
+            y_f_k = Y_flat_val[:, k]
+            # FIX: Ensure reconstruction uses same order='C'
+            Y_numerical.append(y_f_k.reshape(n_u, n_x))  # numpy default is C
+            
+        data_to_save = {
+            "W_matrices": W_numerical,
+            "Y_matrices": Y_numerical,
+            "basis_exponents": basis_exps,
+            "alpha": alpha.value,
+            "mu": mu.value,
+            "degree": degree
+        }
+        with open("rccm_controller_data.pkl", "wb") as f:
+            pickle.dump(data_to_save, f)
+            
+        return W_numerical, Y_numerical, basis_exps
+    else:
+        print(f"Infeasible. Status: {prob.status}")
+        return None, None, None
+    
+    
 def solve_rccm_custom_sos(degree=2):
     print(">>> Setting up RCCM with Custom SOS Engine (Fixed)...")
 
@@ -454,7 +670,7 @@ def solve_rccm_custom_sos(degree=2):
     
 if __name__ == "__main__":
     # Get the 3 return values
-    Ws, Ys, basis_exps = solve_rccm_custom_sos()
+    Ws, Ys, basis_exps = solve_rccm_sample_based(num_samples=50)
     
     if Ws is not None:
         # Pass all 3 to the printer

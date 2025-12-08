@@ -96,11 +96,6 @@ def plot_rccm_results(pos, ref, t, err_norm, tube_alpha=None, dist_max=1.5):
 
 class RCCMSimulator:
     def __init__(self, W_coeffs, Y_coeffs, basis_exps):
-        """
-        W_coeffs: List of numerical matrices [W_0, W_1, ...]
-        Y_coeffs: List of numerical matrices [Y_0, Y_1, ...]
-        basis_exps: List of exponents tuples corresponding to the coeffs
-        """
         self.Ws = W_coeffs
         self.Ys = Y_coeffs
         self.exps = basis_exps
@@ -112,10 +107,6 @@ class RCCMSimulator:
         self.J_inv = np.linalg.inv(self.J)
         
     def get_controller_gain(self, R_curr):
-        """
-        Reconstructs K(R) numerically for the current orientation.
-        Fast and robust.
-        """
         # 1. Evaluate Basis
         r_flat = R_curr.flatten()
         weights = []
@@ -126,27 +117,27 @@ class RCCMSimulator:
             weights.append(val)
             
         # 2. Sum Matrices
-        # Using tensordot or simple loops (loop is fine for small basis)
-        W_num = sum(w * c for w, c in zip(weights, self.Ws))
-        Y_num = sum(y * c for y, c in zip(weights, self.Ys))
+        # Using list comprehension + sum for safety (numpy broadcasting can be tricky with lists)
+        W_num = sum(self.Ws[k] * w for k, w in enumerate(weights))
+        Y_num = sum(self.Ys[k] * w for k, w in enumerate(weights))
         
-        # 3. Compute K = Y * inv(W)
-        # solve(A, B) solves A*X = B -> X = inv(A)*B? No, solve(A, b) is A*x=b.
-        # We want K = Y @ inv(W).
-        # This is equivalent to solving W.T @ K.T = Y.T
-        K_num = np.linalg.solve(W_num.T, Y_num.T).T
+        # 3. Compute K = Y * inv(W) -> K = (W.T \ Y.T).T
+        # W is symmetric, so W.T = W
+        try:
+            K_num = np.linalg.solve(W_num, Y_num.T).T
+        except np.linalg.LinAlgError:
+            print("WARNING: Metric W is singular! Returning zero gain.")
+            return np.zeros((6, 12))
+            
         return K_num
 
     def nominal_trajectory(self, t):
-        """
-        Returns reference state and input for a Figure-8 trajectory.
-        Full State: [p, R_flat, v, w]
-        """
-        # Figure 8 Position
+        # ... (Same as your code) ...
+        # Figure 8
         omega_traj = 1.0
         px = np.sin(omega_traj * t)
         py = np.sin(omega_traj * t / 2)
-        pz = 1.0 # Hover height
+        pz = 1.0 
         
         vx = omega_traj * np.cos(omega_traj * t)
         vy = (omega_traj/2) * np.cos(omega_traj * t / 2)
@@ -156,33 +147,21 @@ class RCCMSimulator:
         ay = -(omega_traj/2)**2 * np.sin(omega_traj * t / 2)
         az = 0
         
-        # Orientation: Keep it simple (Identity) for this test
-        # A real planner would align heading with velocity
         R_ref = np.eye(3)
         w_ref = np.zeros(3)
         dw_ref = np.zeros(3)
         
-        # Nominal Inputs (Inverse Dynamics)
-        # f_W = m * (a - g) -> But dynamics are dot_v = 1/m f_W + g
-        # So f_W = m * (dot_v - g)
+        # Feedforward Inputs
         g_vec = np.array([0, 0, -self.g])
         acc_vec = np.array([ax, ay, az])
         f_nom = self.m * (acc_vec - g_vec)
-        
-        # tau_B = J*dw + w x Jw
-        tau_nom = self.J @ dw_ref + np.cross(w_ref, self.J @ w_ref)
+        tau_nom = np.zeros(3) # Simplified for hover-like ref
         
         u_nom = np.hstack([f_nom, tau_nom])
-        
         return np.hstack([px, py, pz]), R_ref, np.hstack([vx, vy, vz]), w_ref, u_nom
 
     def dynamics(self, t, x_state, u_control, w_dist):
-        """
-        Nonlinear Dynamics of Fully Actuated Multirotor
-        x_state: [p(3), R_flat(9), v(3), w(3)] (Size 18)
-        """
-        # Unpack
-        # p = x_state[0:3]
+        # ... (Same as your code) ...
         R_flat = x_state[3:12]
         R = R_flat.reshape((3,3))
         v = x_state[12:15]
@@ -191,105 +170,103 @@ class RCCMSimulator:
         f_W = u_control[0:3]
         tau_B = u_control[3:6]
         
-        # Disturbances
         f_dist = w_dist[0:3]
         tau_dist = w_dist[3:6]
         
-        # Equations of Motion
-        # 1. p_dot = v
         dp = v
-        
-        # 2. R_dot = R * skew(w)
         w_hat = np.array([[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]])
         dR = R @ w_hat
         
-        # 3. v_dot = 1/m * (f_W) + g + 1/m * f_dist
-        # Note: If f_W is world force, gravity is just vector addition
         g_vec = np.array([0, 0, -self.g])
         dv = (1.0/self.m) * (f_W + f_dist) + g_vec
         
-        # 4. w_dot = J_inv * (tau_B - w x Jw + tau_dist)
         torque_net = tau_B + tau_dist - np.cross(w, self.J @ w)
         dw = self.J_inv @ torque_net
         
         return np.concatenate([dp, dR.flatten(), dv, dw])
 
-    def run_simulation(self, duration=10.0, dt=0.01):
+    def run_simulation(self, duration=10.0, dt=0.001): 
         steps = int(duration / dt)
         times = np.linspace(0, duration, steps)
         
-        # Initial State (Slightly perturbed)
         p0, R0, v0, w0, _ = self.nominal_trajectory(0)
-        p_act = p0 + np.array([0.2, -0.2, 0.1]) # Position Error
-        R_act = R0 # Start with correct orientation
+        p_act = p0 + np.array([0.2, -0.2, 0.1]) 
+        R_act = R0
         state = np.concatenate([p_act, R_act.flatten(), v0, w0])
         
-        # History
         pos_hist = []
         pos_ref_hist = []
         err_norm_hist = []
         
-        print(">>> Starting Simulation...")
+        print(f">>> Starting Simulation (dt={dt}s)...")
+        
         for i, t in enumerate(times):
-            # 1. Get Nominal
             p_ref, R_ref, v_ref, w_ref, u_nom = self.nominal_trajectory(t)
             
-            # 2. Unpack Current State
             p_curr = state[0:3]
             R_curr = state[3:12].reshape((3,3))
             v_curr = state[12:15]
             w_curr = state[15:18]
             
-            # 3. Compute Error State
-            # Matches order: [p, eta, v, w]
+            # Error State
             e_p = p_curr - p_ref
             e_v = v_curr - v_ref
             e_w = w_curr - w_ref
             
-            # Attitude Error (Geodesic/Log map approximation)
-            # R_err = R_ref.T @ R_curr
-            # eta approx 0.5 * vee(R_err - R_err.T)
             R_err = R_ref.T @ R_curr
             skew_sym = 0.5 * (R_err - R_err.T)
             eta = np.array([skew_sym[2,1], skew_sym[0,2], skew_sym[1,0]])
-            # Rotate eta back to world frame? 
-            # Our derivation A-matrix assumed eta was tangent to R. 
-            # Usually K expects eta in Body frame.
             
             error_vec = np.concatenate([e_p, eta, e_v, e_w])
             
-            # 4. Compute Control (RCCM)
-            # Get K for current orientation
+            # --- CONTROL CALCULATION ---
             K = self.get_controller_gain(R_curr)
             
-            # Feedback u_fb = K * error
-            # Note: K is 6x12. Error is 12x1.
-            u_fb = K @ error_vec # Negative feedback
+            # Feedback Law: u = K * x_error
+            u_fb = K @ error_vec 
+            
+            # !!! SAFETY CLAMP !!!
+            # Real motors cannot produce infinite force. 
+            # This prevents numerical explosion when error is large.
+            u_fb = np.clip(u_fb, -50.0, 50.0) 
             
             u_total = u_nom + u_fb
             
-            # 5. Disturbance (Wind Gusts)
+            # Disturbance
             dist = np.zeros(6)
             if 2.0 < t < 4.0:
-                dist[0] = 1.5 # 1.5 N wind in X
-                dist[3] = 0.1 # Small torque disturbance
+                dist[0] = 1.5 
+                dist[3] = 0.1 
             
-            # 6. Step Dynamics (Euler Integration)
+            # Step Dynamics
             dstate = self.dynamics(t, state, u_total, dist)
             state = state + dstate * dt
             
-            # Re-orthonormalize R (Crucial for integration stability)
-            U, _, Vt = np.linalg.svd(state[3:12].reshape((3,3)))
-            R_clean = U @ Vt
-            state[3:12] = R_clean.flatten()
+            # !!! DIVERGENCE CHECK !!!
+            # Stop before SVD crashes if numbers are broken
+            if np.any(np.isnan(state)) or np.linalg.norm(state[0:3]) > 100.0:
+                print(f"!!! SIMULATION DIVERGED at t={t:.2f}s !!!")
+                print(f"Position: {state[0:3]}")
+                print(f"Control Input: {u_total}")
+                break
+
+            # Re-orthonormalize R
+            # Because we check for NaN above, this line is now safe
+            try:
+                U, _, Vt = np.linalg.svd(state[3:12].reshape((3,3)))
+                R_clean = U @ Vt
+                state[3:12] = R_clean.flatten()
+            except np.linalg.LinAlgError:
+                print(f"SVD Failed at t={t:.2f}. Matrix:\n{state[3:12].reshape((3,3))}")
+                break
             
-            # Log
             pos_hist.append(p_curr)
             pos_ref_hist.append(p_ref)
             err_norm_hist.append(np.linalg.norm(error_vec))
 
-        return np.array(pos_hist), np.array(pos_ref_hist), times, err_norm_hist
-
+        return np.array(pos_hist), np.array(pos_ref_hist), times[:len(pos_hist)], np.array(err_norm_hist)
+    
+    
 if __name__ == "__main__":
     # 1. Load the data
     print("Loading controller data...")
