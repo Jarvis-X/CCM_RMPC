@@ -187,7 +187,7 @@ def create_sos_constraint(poly_matrix, n_vars, degree):
 # ==============================================================================
 # PART 2: SOLVER
 # ==============================================================================
-def solve_rccm_custom_sos():
+def solve_rccm_custom_sos(degree=2):
     print(">>> Setting up RCCM with Custom SOS Engine (Fixed)...")
 
     n_x, n_u, n_w, n_r = 12, 6, 6, 9
@@ -348,7 +348,7 @@ def solve_rccm_custom_sos():
         # Enforce LMI 1 (Using Degree 4 check)
         Total_Poly_1 = (LMI1_Poly + S_proc_poly) * -1
         # FIX: degree=4 here
-        sos_cons_1, _ = create_sos_constraint(Total_Poly_1, n_vars=9, degree=4)
+        sos_cons_1, _ = create_sos_constraint(Total_Poly_1, n_vars=9, degree=degree)
         constraints += sos_cons_1
 
         # --- 4. LMI 2: Tube Gain ---
@@ -406,7 +406,7 @@ def solve_rccm_custom_sos():
         Total_Poly_2 = LMI2_Poly + (S_proc_poly_2 * -1) # Subtract S-proc to enforce on manifold
         
         # FIX: degree=4 here
-        sos_cons_2, _ = create_sos_constraint(Total_Poly_2, n_vars=9, degree=4)
+        sos_cons_2, _ = create_sos_constraint(Total_Poly_2, n_vars=9, degree=degree)
         constraints += sos_cons_2
 
     print(">>> Solving SOS SDP...")
