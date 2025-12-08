@@ -256,85 +256,70 @@ def solve_rccm_custom_sos():
     # Pass explicit shape (18, 18) for S-procedure poly
     S_proc_poly = PolynomialMatrix(constraints_poly, range(n_r), shape=(18,18))
 
+    # ==========================================
     # 3. BUILD LMI
+    # ==========================================
     constraints = []
     # W0 >> 0
     constraints.append(W_coeffs[tuple([0]*9)] >> 0.01 * np.eye(n_x))
     
     w_corners = [np.zeros(3), np.array([5,5,5]), np.array([5,-5,-5])]
 
+    print(f"Building SOS constraints (Degree 4)...")
+
     for w_val in w_corners:
-        # 1. Compute W_dot (Generic Chain Rule)
-        # W_dot = sum_{monomials} W_mat * d(monomial)/dt
-        # d/dt (r_a^p_a * r_b^p_b...) = sum_i  (p_i * r_i^(p_i-1) * r_dot_i * rest_of_monomial)
         
+        # --- 1. Compute W_dot (Degree 4 Compatible) ---
         W_dot_coeffs = {}
         
-        # Precompute R_dot linear map components: skew(w)
-        # R_dot = R @ w_hat
         w_hat = np.array([[0, -w_val[2], w_val[1]], 
                           [w_val[2], 0, -w_val[0]], 
                           [-w_val[1], w_val[0], 0]])
         
         for exp, W_mat in W_coeffs.items():
-            # Check if constant term (derivative is 0)
             if sum(exp) == 0: continue
             
-            # Iterate over every variable r_idx in the monomial
+            # Iterate over variables in the monomial
             for r_idx, power in enumerate(exp):
                 if power == 0: continue
                 
-                # We are taking the derivative w.r.t r_idx
-                # r_idx corresponds to matrix position (row, col)
+                # Derivative Chain Rule
                 row, col = divmod(r_idx, 3)
                 
-                # 1. Reduce power of this variable by 1
+                # 1. Reduce power
                 base_exp = list(exp)
                 base_exp[r_idx] -= 1
                 
-                # 2. Multiply by r_dot_{row,col}
-                # r_dot_{row,col} = sum_k (r_{row,k} * w_hat_{k,col})
-                # This introduces a new variable r_{row,k} (increasing its power by 1)
+                # 2. Multiply by R_dot components
                 for k in range(3):
                     weight = w_hat[k, col]
-                    
                     if abs(weight) > 1e-6:
-                        # Identify the index of r_{row,k}
                         target_r_idx = 3*row + k
-                        
-                        # Construct the final exponent tuple
                         target_exp_list = base_exp.copy()
                         target_exp_list[target_r_idx] += 1
                         target_exp = tuple(target_exp_list)
                         
-                        # Accumulate: W_mat * power * weight
-                        if target_exp not in W_dot_coeffs:
+                        if target_exp not in W_dot_coeffs: 
                             W_dot_coeffs[target_exp] = 0
-                        
-                        # Chain rule scalar: (power * weight)
                         W_dot_coeffs[target_exp] += W_mat * (power * weight)
 
-        # Handle empty W_dot (e.g. if w=0)
         if not W_dot_coeffs: 
             W_dot_coeffs[tuple([0]*9)] = np.zeros((n_x, n_x))
             
         W_dot_poly = PolynomialMatrix(W_dot_coeffs, range(n_r), shape=(n_x, n_x))
         
-        # A(w)
+        # --- 2. System Matrices A, B ---
         Jw_hat = np.array([[0,-(J_val@w_val)[2],(J_val@w_val)[1]], [(J_val@w_val)[2],0,-(J_val@w_val)[0]], [-(J_val@w_val)[1],(J_val@w_val)[0],0]])
         term_dyn = J_inv @ (Jw_hat - w_hat @ J_val)
         A_num = np.zeros((12, 12))
         A_num[0:3, 6:9] = np.eye(3); A_num[3:6, 3:6] = -w_hat
         A_num[3:6, 9:12] = np.eye(3); A_num[9:12, 9:12] = term_dyn
         
-        # (Helper to promote constant matrix to poly)
-        def const_poly(M, dim_r, dim_c):
-            return PolynomialMatrix({tuple([0]*9): M}, range(9))
-            
-        A_poly = const_poly(A_num, 12, 12)
-        B_poly = const_poly(B_np, 12, 6)
-        
-        # Operations for LMI 1
+        # --- 3. LMI 1: Stability ---
+        # Helper for constants
+        def const_poly(M, shape):
+            return PolynomialMatrix({tuple([0]*9): M}, range(n_r), shape=shape)
+
         AW = PolynomialMatrix({}, range(n_r), shape=(n_x, n_x))
         for exp, mat in W_poly.coeffs.items(): AW.coeffs[exp] = A_num @ mat
             
@@ -344,8 +329,8 @@ def solve_rccm_custom_sos():
         He = (AW + BY) + (AW + BY).transpose()
         Term1 = (W_dot_poly * -1) + He + (W_poly * (2*lam))
         
-        # Construct LMI 1 Poly Block
         LMI1_coeffs = {}
+        # Union of keys to ensure we cover all terms
         all_keys_1 = set(Term1.coeffs.keys()) | {tuple([0]*9)}
         
         for exp in all_keys_1:
@@ -360,85 +345,68 @@ def solve_rccm_custom_sos():
             
         LMI1_Poly = PolynomialMatrix(LMI1_coeffs, range(n_r), shape=(18,18))
         
-        # Enforce LMI 1: -(LMI1 + S_proc) is SOS
-        # We need a unique S-proc multiplier for this specific constraint
-        # (Ideally create new S_proc_poly_1 here, but reusing S_proc_poly structure is okay for demo if distinct variables used)
-        # To be rigorous, define new S-procedure variables for this LMI
-        
-        # For this fix, let's assume we use the S_proc_poly defined outside (or define a new one here)
+        # Enforce LMI 1 (Using Degree 4 check)
         Total_Poly_1 = (LMI1_Poly + S_proc_poly) * -1
-        sos_cons_1, _ = create_sos_constraint(Total_Poly_1, n_vars=9, degree=2)
+        # FIX: degree=4 here
+        sos_cons_1, _ = create_sos_constraint(Total_Poly_1, n_vars=9, degree=4)
         constraints += sos_cons_1
 
-        # --- LMI 2: TUBE GAIN (Eq 14) ---  <-- THIS WAS MISSING
-        # Block Matrix:
-        # [ lam*W       0             (CW + DY).T ]
-        # [ 0           (alpha-mu)I   0           ]  >> 0
-        # [ CW + DY     0             alpha*I     ]
-        
-        # 1. Compute CW + DY
-        CW_DY = PolynomialMatrix({}, range(n_r), shape=(n_x, n_x)) # Shape based on C (12x12)
-        # Note: Y is (6x12), D is (12x6)? No, D maps u->z. 
-        # In our case z=x (weighted), so C is 12x12, D is 12x6.
-        # D is zero in our setup. So just C*W.
-        
-        # C_w is diagonal constant
+        # --- 4. LMI 2: Tube Gain ---
+        CW_DY = PolynomialMatrix({}, range(n_r), shape=(12, 12))
         for exp, mat in W_poly.coeffs.items():
             CW_DY.coeffs[exp] = C_w @ mat
             
-        # 2. Construct LMI 2 Poly Block
         LMI2_coeffs = {}
         all_keys_2 = set(W_poly.coeffs.keys()) | {tuple([0]*9)}
         
-        # Dimensions
-        dim_z = 12 # Output dimension
-        dim_w = 6  # Disturbance dimension
+        dim_z, dim_w = 12, 6
         
         for exp in all_keys_2:
-            # Get W block
             w_blk = W_poly.coeffs.get(exp, np.zeros((n_x, n_x)))
-            # Get CW block
             cw_blk = CW_DY.coeffs.get(exp, np.zeros((dim_z, n_x)))
             
-            # Construct Rows
-            # Row 1: [ lam*W,  0,  CW.T ]
             row1 = cp.hstack([lam * w_blk, np.zeros((n_x, dim_w)), cw_blk.T])
             
-            # Row 2: [ 0, (alpha-mu)I, 0 ]
-            # Row 3: [ CW, 0, alpha*I ]
             if sum(exp) == 0:
-                # Constant term includes alpha/mu variables
-                mid_blk = (alpha - mu) * np.eye(dim_w)
-                bot_blk = alpha * np.eye(dim_z)
-                row2 = cp.hstack([np.zeros((dim_w, n_x)), mid_blk, np.zeros((dim_w, dim_z))])
-                row3 = cp.hstack([cw_blk, np.zeros((dim_z, dim_w)), bot_blk])
+                row2 = cp.hstack([np.zeros((dim_w, n_x)), (alpha - mu) * np.eye(dim_w), np.zeros((dim_w, dim_z))])
+                row3 = cp.hstack([cw_blk, np.zeros((dim_z, dim_w)), alpha * np.eye(dim_z)])
             else:
-                # Non-constant terms do not have alpha/mu
                 row2 = cp.hstack([np.zeros((dim_w, n_x)), np.zeros((dim_w, dim_w)), np.zeros((dim_w, dim_z))])
                 row3 = cp.hstack([cw_blk, np.zeros((dim_z, dim_w)), np.zeros((dim_z, dim_z))])
             
             LMI2_coeffs[exp] = cp.vstack([row1, row2, row3])
             
-        LMI2_Poly = PolynomialMatrix(LMI2_coeffs, range(n_r), shape=(12+6+12, 12+6+12))
+        LMI2_Poly = PolynomialMatrix(LMI2_coeffs, range(n_r), shape=(30, 30))
         
-        # Enforce LMI 2: (LMI2 - S_proc_2) is SOS
-        # Note: LMI2 must be Positive Definite (>> 0), unlike LMI1 which was Negative Definite.
-        # So we do NOT multiply by -1.
-        # We need a new S-procedure poly for this size (30x30)
-        # For simplicity in this patch, we can relax S-proc for LMI2 or create a new one.
-        # Let's create a minimal constant S-proc for LMI2 to ensure manifold validity.
-        
-        # (Simplified S-proc creation for 30x30 matrix)
+        # --- FIX: CREATE S-PROCEDURE FOR LMI 2 ---
+        # We need a NEW multiplier matrix M2 because the dimension is 30x30 (LMI1 was 18x18)
         constraints_poly_2 = {}
         for i in range(3):
             for j in range(i, 3):
                 M2 = cp.Variable((30, 30), symmetric=True)
-                const_exp = tuple([0]*9); quad_exp = ... # (Same logic as before)
-                # ... Populate constraints_poly_2 ...
-                # For brevity, if you skip S-proc on LMI2, it just means tube holds globally (more conservative).
-                # To be consistent, let's just assert LMI2_Poly is SOS directly (Global validity)
+                
+                # Construct polynomial: M2 * (r_ki*r_kj - delta)
+                const_exp = tuple([0]*9)
+                if i == j:
+                    if const_exp not in constraints_poly_2: constraints_poly_2[const_exp] = 0
+                    constraints_poly_2[const_exp] -= M2
+                
+                for k in range(3):
+                    idx1, idx2 = 3*k + i, 3*k + j
+                    exp_list = [0]*9
+                    exp_list[idx1] += 1
+                    exp_list[idx2] += 1
+                    quad_exp = tuple(exp_list)
+                    if quad_exp not in constraints_poly_2: constraints_poly_2[quad_exp] = 0
+                    constraints_poly_2[quad_exp] += M2
+                    
+        S_proc_poly_2 = PolynomialMatrix(constraints_poly_2, range(n_r), shape=(30, 30))
         
-        sos_cons_2, _ = create_sos_constraint(LMI2_Poly, n_vars=9, degree=2)
+        # Enforce LMI 2 (Total - S_proc >> 0)
+        Total_Poly_2 = LMI2_Poly + (S_proc_poly_2 * -1) # Subtract S-proc to enforce on manifold
+        
+        # FIX: degree=4 here
+        sos_cons_2, _ = create_sos_constraint(Total_Poly_2, n_vars=9, degree=4)
         constraints += sos_cons_2
 
     print(">>> Solving SOS SDP...")
