@@ -329,46 +329,109 @@ def solve_rccm_sos(mode='ROTATION', degree=2):
         W_out = [W_coeffs[k].value for k in s_keys]
         Y_out = [Y_coeffs[k].value for k in s_keys]
         
-        return W_out, Y_out, s_keys
+        return W_out, Y_out, s_keys, alpha.value
     else:
         print("Infeasible"); return None, None, None
 
 # ==============================================================================
 # PART 3: UNIVERSAL ANALYZER
 # ==============================================================================
-def analyze_results(Ws, Ys, basis_exps):
-    """Works for both Rotation and Quaternion results."""
-    dim_var = len(basis_exps[0])
-    mode = 'ROTATION' if dim_var == 9 else 'QUATERNION'
-    print(f"\n>>> ANALYZING {mode} CONTROLLER")
+def print_matrices_and_gains(Ws, Ys, basis_exps):
+    """
+    Universal Analyzer: Automatically detects Rotation (9 vars) vs Quaternion (4 vars).
+    """
+    # 1. Detect Mode
+    dim_vars = len(basis_exps[0])
+    if dim_vars == 9:
+        mode = 'ROTATION'
+        sym_names = ['r11', 'r12', 'r13', 'r21', 'r22', 'r23', 'r31', 'r32', 'r33']
+    elif dim_vars == 4:
+        mode = 'QUATERNION'
+        sym_names = ['qw', 'qx', 'qy', 'qz']
+    else:
+        raise ValueError(f"Unknown basis dimension: {dim_vars}")
+
+    print("\n" + "="*60)
+    print(f">>> ANALYZING {mode} CONTROLLER (Basis Size: {len(Ws)})")
+    print("="*60)
+
+    # 2. Setup Symbols
+    syms = sp.symbols(' '.join(sym_names))
+
+    # 3. Construct Symbolic Basis Vector
+    basis_syms = []
+    for exp in basis_exps:
+        term = 1
+        for i, power in enumerate(exp):
+            if power > 0:
+                term *= (syms[i] ** power)
+        basis_syms.append(term)
+
+    # 4. Extract Values
+    def get_val(item):
+        if hasattr(item, 'value'): return item.value
+        if item is None: return np.zeros((12,12)) # Safety
+        return item
+
+    W_vals = [np.where(abs(get_val(mat)) < 1e-5, 0, get_val(mat)) for mat in Ws]
+    Y_vals = [np.where(abs(get_val(mat)) < 1e-5, 0, get_val(mat)) for mat in Ys]
+
+    # 5. Symbolic Print (Top-Left Block)
+    print(f"Constructing Symbolic {mode} Representations...")
+    W_pos_sym = sp.zeros(3, 3)
+    for k, mat in enumerate(W_vals):
+        if np.any(mat[0:3, 0:3]):
+            W_pos_sym += sp.Matrix(mat[0:3, 0:3]) * basis_syms[k]
+
+    print("\n[1] SYMBOLIC METRIC W (Position Block):")
+    sp.pprint(W_pos_sym)
+
+    # 6. Numerical Gain Analysis
+    print("\n[2] GAIN SCHEDULING ANALYSIS")
     
-    # Symbols
-    if mode == 'ROTATION': syms = sp.symbols('r11 r12 r13 r21 r22 r23 r31 r32 r33')
-    else: syms = sp.symbols('qw qx qy qz')
-        
-    # Numerical Gain
-    def get_K(vec):
+    def get_K(state_vec):
         weights = []
         for exp in basis_exps:
-            v = 1.0
-            for i, p in enumerate(exp): 
-                if p>0: v *= vec[i]**p
-            weights.append(v)
-        W = sum(Ws[k] * weights[k] for k in range(len(Ws)))
-        Y = sum(Ys[k] * weights[k] for k in range(len(Ys)))
-        return Y @ np.linalg.inv(W + 1e-6*np.eye(12))
+            val = 1.0
+            for i, p in enumerate(exp):
+                if p > 0: val *= (state_vec[i] ** p)
+            weights.append(val)
+        
+        W_curr = sum(W_vals[k] * weights[k] for k in range(len(weights)))
+        Y_curr = sum(Y_vals[k] * weights[k] for k in range(len(weights)))
+        
+        # Regularize
+        W_curr += 1e-6 * np.eye(12)
+        return Y_curr @ np.linalg.inv(W_curr)
 
-    print("\nGain Scheduling Check:")
+    # Define Test Conditions
     if mode == 'ROTATION':
-        K1 = get_K(np.eye(3).flatten())
-        K2 = get_K(Rotation.from_euler('x', 45, degrees=True).as_matrix().flatten())
+        # Flattened Rotation Matrices
+        s_hover = np.eye(3).flatten()
+        s_yaw90 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]).flatten()
+        
+        theta = np.deg2rad(45)
+        s_roll45 = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]]).flatten()
     else:
-        K1 = get_K(np.array([1,0,0,0]))
-        K2 = get_K(Rotation.from_euler('x', 45, degrees=True).as_quat()[[3,0,1,2]]) # [w,x,y,z]
+        # Quaternions [w, x, y, z]
+        s_hover = np.array([1, 0, 0, 0])
+        # Yaw 90 (about Z)
+        s_yaw90 = np.array([0.7071, 0, 0, 0.7071]) 
+        # Roll 45 (about X) -> cos(22.5), sin(22.5), 0, 0
+        s_roll45 = np.array([0.9239, 0.3827, 0, 0])
 
-    print(f"Hover K_px: {K1[0,0]:.4f}")
-    print(f"Roll45 K_px: {K2[0,0]:.4f}")
-    print(f"Norm Diff: {np.linalg.norm(K1-K2):.4f}")
+    K_hover = get_K(s_hover)
+    K_yaw = get_K(s_yaw90)
+    K_roll = get_K(s_roll45)
+
+    print(f"{'Condition':<15} | {'K_px':<10} | {'K_py':<10}")
+    print("-" * 40)
+    print(f"{'Hover':<15} | {K_hover[0,0]:<10.4f} | {K_hover[0,1]:<10.4f}")
+    print(f"{'Yaw 90':<15} | {K_yaw[0,0]:<10.4f} | {K_yaw[0,1]:<10.4f}")
+    print(f"{'Roll 45':<15} | {K_roll[0,0]:<10.4f} | {K_roll[0,1]:<10.4f}")
+
+    diff = np.linalg.norm(K_hover - K_yaw)
+    print(f"\nGain Difference (Hover vs Yaw): {diff:.4f}")
 
 # ==============================================================================
 # SOLVER 1: ROTATION MATRIX (Tensorized, Degree 4)
@@ -612,11 +675,11 @@ if __name__ == "__main__":
     #     Ws, Ys, exps, alpha = solve_rccm_quaternion(degree=DEGREE, num_samples=50)
     
     # full SOS
-    Ws, Ys, exps = solve_rccm_sos(mode='QUATERNION', degree=4)
+    Ws, Ys, exps, alpha = solve_rccm_sos(mode='QUATERNION', degree=4)
         
     if Ws is not None:
         # 1. Analyze
-        analyze_results(Ws, Ys, exps)
+        print_matrices_and_gains(Ws, Ys, exps)
         
         # 2. Save for Simulator
         data = {
