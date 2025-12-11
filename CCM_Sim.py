@@ -454,7 +454,7 @@ class RCCMSimulator:
         
         f_nom = self.m*(np.array([ax,ay,az]) - np.array([0,0,-9.81]))
         
-        psi, theta, phi = 0.5*t, 0.35*np.sin(2*t), 0.0
+        psi, theta, phi = 0.0, 0.35*np.sin(2*t), 0.0
         R_ref = Rotation.from_euler('zyx', [psi, theta, phi]).as_matrix()
         
         # Angular Velocity (Body Frame)
@@ -462,7 +462,7 @@ class RCCMSimulator:
         sp, cp = np.sin(phi), np.cos(phi)
         
         # 1st Derivatives of Euler Angles
-        dpsi = 0.5
+        dpsi = 0.0
         dtheta = 0.7 * np.cos(2*t)
         dphi = 0.0
         
@@ -472,29 +472,12 @@ class RCCMSimulator:
         ddphi = 0.0
 
         # w_ref (Body Rates)
-        wx = dphi - dpsi * st
-        wy = dtheta * cp + dpsi * ct * sp
-        wz = dpsi * ct * cp - dtheta * sp
-        w_ref = np.array([wx, wy, wz])
+        w_ref = np.array([dpsi, dtheta, dphi])
         
         # Angular Acceleration (dw_ref)
         # Computed by differentiating w_ref components w.r.t time
         # Chain rule: d(sin(q))/dt = cos(q)*dq
-        
-        # dwx = ddphi - (ddpsi*st + dpsi*ct*dtheta)
-        dwx = ddphi - (ddpsi * st + dpsi * ct * dtheta)
-        
-        # dwy = (ddtheta*cp - dtheta*sp*dphi) + (ddpsi*ct*sp - dpsi*st*dtheta*sp + dpsi*ct*cp*dphi)
-        term1_y = ddtheta * cp - dtheta * sp * dphi
-        term2_y = ddpsi * ct * sp - dpsi * st * dtheta * sp + dpsi * ct * cp * dphi
-        dwy = term1_y + term2_y
-        
-        # dwz = (ddpsi*ct*cp - dpsi*st*dtheta*cp - dpsi*ct*sp*dphi) - (ddtheta*sp + dtheta*cp*dphi)
-        term1_z = ddpsi * ct * cp - dpsi * st * dtheta * cp - dpsi * ct * sp * dphi
-        term2_z = ddtheta * sp + dtheta * cp * dphi
-        dwz = term1_z - term2_z
-        
-        dw_ref = np.array([dwx, dwy, dwz])
+        dw_ref = np.array([ddpsi, ddtheta, ddphi])
         
         # Accurate Feedforward Torque
         # tau = J * dw + w x (J * w)
@@ -561,7 +544,7 @@ class RCCMSimulator:
             u_total = u_nom + np.clip(u_fb, -50, 50)
             
             # Disturbance
-            dist = np.random.normal(0,0.2,6)
+            dist = np.random.normal(0, 1, 6)
             if 2.0<t<4.0: dist[0]+=1.5; dist[3]+=0.1
             
             state_next = self.rk4_step(t, state, u_total, dist, dt)
